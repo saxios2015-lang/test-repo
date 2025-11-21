@@ -1,3 +1,4 @@
+// pages/api/coverage.js
 import { request } from "undici";
 import fs from "node:fs";
 import path from "node:path";
@@ -52,77 +53,95 @@ function operatorFromMccMnc(mcc, mnc) {
   return MCCMNC_MAP[key];
 }
 
-// ---- OpenCelliD query (adaptive + multi-ring fan-out) ----
-// Each request stays under the ~4 km² limit; we sample up to 3 rings
-// around the ZIP centroid to improve rural hit rate.
-async function queryOpenCellIdLTE({ lat, lon }) {
-  const key = process.env.OPENCELLID_API_KEY;
-  if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
+// ---- OpenCelliD single-box (adaptive) ----
+async function fetchOpenCellIdBox({ lat, lon, radio, key, dStart = 0.008 }) {
+  let d = dStart;               // ~1.5–2km half-side (under 4 km² per request)
+  const minD = 0.004;           // ~0.8–1km half-side
+  for (let i = 0; i < 6; i++) {
+    const bbox = `${(lat - d).toFixed(6)},${(lon - d).toFixed(6)},${(lat + d).toFixed(6)},${(lon + d).toFixed(6)}`;
+    const url = `https://www.opencellid.org/cell/getInArea?key=${encodeURIComponent(
+      key
+    )}&BBOX=${bbox}&radio=${encodeURIComponent(radio)}&format=json`;
+    const { body } = await request(url, { method: "GET" });
+    const text = await body.text();
 
-  const boxD = 0.008;        // ~1.5–2 km half-side (safe per-request)
-  const rings = 3;           // 0 (center) + 1 + 2 + 3 rings => up to 36 boxes max
-  const hardCap = 24;        // don’t exceed this many requests
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return []; // non-JSON (e.g., HTML throttle) → treat as empty
+    }
+
+    if (data?.error && String(data.error).toLowerCase().includes("bbox too big")) {
+      d = Math.max(minD, d / 2);
+      continue;
+    }
+
+    const cells = Array.isArray(data?.cells) ? data.cells :
+                  Array.isArray(data) ? data : [];
+    return cells
+      .filter(c => c && c.mcc !== undefined && c.mnc !== undefined)
+      .map(c => ({ ...c, radio }));
+  }
+  return [];
+}
+
+// ---- Multi-ring fan-out (center + 3 rings) for one radio ----
+async function fanoutForRadio({ lat, lon, radio, key }) {
+  const boxD = 0.008;   // per-request half-side
+  const rings = 3;      // 0..3 rings (up to 36 boxes)
+  const hardCap = 24;   // guardrail per radio
 
   function ringOffsets(r) {
     if (r === 0) return [[0, 0]];
     const vals = [-r, 0, r];
     const out = [];
-    for (const dy of vals) {
-      for (const dx of vals) {
-        if (dy === 0 && dx === 0) continue;
-        out.push([dy * boxD, dx * boxD]);
-      }
+    for (const dy of vals) for (const dx of vals) {
+      if (dy === 0 && dx === 0) continue;
+      out.push([dy * boxD, dx * boxD]);
     }
     return out;
   }
 
-  async function fetchBox(centerLat, centerLon, dStart = boxD) {
-    let d = dStart;
-    const minD = 0.004;  // ~0.8–1 km half-side
-    for (let i = 0; i < 6; i++) {
-      const bbox = `${(centerLat - d).toFixed(6)},${(centerLon - d).toFixed(6)},${(centerLat + d).toFixed(6)},${(centerLon + d).toFixed(6)}`;
-      const url = `https://www.opencellid.org/cell/getInArea?key=${encodeURIComponent(
-        key
-      )}&BBOX=${bbox}&radio=LTE&format=json`;
-      const { body } = await request(url, { method: "GET" });
-      const text = await body.text();
-
-      let data;
-      try { data = JSON.parse(text); } catch { return []; }
-
-      if (data?.error && String(data.error).toLowerCase().includes("bbox too big")) {
-        d = Math.max(minD, d / 2);
-        continue;
-      }
-
-      const cells = Array.isArray(data?.cells) ? data.cells :
-                    Array.isArray(data) ? data : [];
-      return cells.filter(c => c && c.mcc !== undefined && c.mnc !== undefined);
-    }
-    return [];
-  }
-
-  const seen = new Set();
+  const seen = new Set(); // dedupe by mcc-mnc-cid-radio
   const all = [];
   let calls = 0;
 
   for (let r = 0; r <= rings; r++) {
-    const offsets = ringOffsets(r);
-    for (const [dy, dx] of offsets) {
+    for (const [dy, dx] of ringOffsets(r)) {
       if (calls >= hardCap) break;
       calls++;
-      const cells = await fetchBox(lat + dy, lon + dx);
+      const cells = await fetchOpenCellIdBox({ lat: lat + dy, lon: lon + dx, radio, key, dStart: boxD });
       for (const c of cells) {
         const cid = c.cid ?? c.cellid ?? "";
-        const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}`;
+        const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}-${radio}`;
         if (!seen.has(id)) { seen.add(id); all.push(c); }
       }
-      // Early stop if we already have plenty of samples
       if (all.length >= 40) break;
     }
     if (calls >= hardCap || all.length >= 40) break;
   }
+  return all;
+}
 
+// ---- High-level queries ----
+async function queryLTE({ lat, lon }) {
+  const key = process.env.OPENCELLID_API_KEY;
+  if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
+  return fanoutForRadio({ lat, lon, radio: "LTE", key });
+}
+
+async function queryAnyRadios({ lat, lon }) {
+  const key = process.env.OPENCELLID_API_KEY;
+  if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
+
+  // Common radios in OpenCelliD (order by modern-first)
+  const radios = ["NR", "LTE", "WCDMA", "UMTS", "GSM", "CDMA"];
+  const all = [];
+  for (const r of radios) {
+    const cells = await fanoutForRadio({ lat, lon, radio: r, key });
+    all.push(...cells);
+  }
   return all;
 }
 
@@ -136,34 +155,83 @@ export default async function handler(req, res) {
     }
 
     const geo = await geocodeZip(zip);
-    const cells = await queryOpenCellIdLTE(geo);
 
-    const present = new Set();
-    for (const c of cells) {
+    // 1) LTE first (TG3 is LTE-only)
+    const lteCells = await queryLTE(geo);
+    const lteOpsSet = new Set();
+    for (const c of lteCells) {
       const op = operatorFromMccMnc(c.mcc, c.mnc);
-      if (op) present.add(op);
+      if (op) lteOpsSet.add(op);
     }
+    const lteOperators = Array.from(lteOpsSet);
 
-    const presentOperators = Array.from(present);
+    // EU2/US2 decision (LTE-only)
     const allowed = buildAllowedSet();
-    const matches = presentOperators.filter(op => allowed.has(op));
-    const connects = matches.length > 0;
+    const networks = lteOperators.filter(op => allowed.has(op));
+    const connects = networks.length > 0;
+
+    // Always build a structured detection list for UI: [{radio, operator}]
+    const detected = [];
+    // Start with LTE detections
+    for (const op of lteOperators) detected.push({ radio: "LTE", operator: op });
 
     let reason;
+    let presentOperators = lteOperators; // default to LTE-only list
+    let cellsCount = lteCells.length;
+
     if (!connects) {
-      if (presentOperators.length) {
-        reason = `No FloLive EU2/US2 networks in ${zip} (${geo.place}), but LTE towers were detected for: ${presentOperators.join(", ")}.`;
+      if (lteOperators.length > 0) {
+        reason = `No FloLive EU2/US2 networks in ${zip} (${geo.place}), but LTE towers were detected for: ${lteOperators.join(", ")}.`;
       } else {
-        reason = `No LTE towers found near ${zip} (${geo.place}). Crowd data may be sparse in this area.`;
+        // 2) No LTE at all → look for ANY radio and list providers with radio types
+        const anyCells = await queryAnyRadios(geo);
+        cellsCount = anyCells.length;
+
+        // Build radio → operators map and detected[]
+        const byRadio = new Map();
+        const seenPairs = new Set();
+
+        for (const c of anyCells) {
+          const op = operatorFromMccMnc(c.mcc, c.mnc);
+          const r = (c.radio || "").toUpperCase();
+          if (!op || !r) continue;
+
+          if (!byRadio.has(r)) byRadio.set(r, new Set());
+          byRadio.get(r).add(op);
+
+          const key = `${r}::${op}`;
+          if (!seenPairs.has(key)) {
+            seenPairs.add(key);
+            detected.push({ radio: r, operator: op });
+          }
+        }
+
+        if (byRadio.size > 0) {
+          // Create concise human-readable reason
+          const parts = [];
+          for (const [r, ops] of byRadio.entries()) {
+            parts.push(`${r}: ${Array.from(ops).join(", ")}`);
+          }
+          parts.sort();
+          reason = `No LTE towers found near ${zip} (${geo.place}). Detected other towers: ${parts.join("; ")}.`;
+          // presentOperators becomes union of all detected operators (any radio)
+          presentOperators = Array.from(
+            new Set(detected.map(d => d.operator))
+          );
+        } else {
+          reason = `No towers of any radio type found near ${zip} (${geo.place}). Crowd data may be sparse in this area.`;
+          presentOperators = [];
+        }
       }
     }
 
     res.status(200).json({
-      connects,
-      networks: matches,
-      reason,
-      presentOperators,         // always returned for UI
-      cellsCount: cells.length,
+      connects,                 // TG3 can connect?
+      networks,                 // EU2/US2 matches (LTE-only)
+      reason,                   // explanation
+      presentOperators,         // LTE ops if LTE exists; else union of all detected ops
+      detected,                 // [{ radio, operator }] for UI display
+      cellsCount,               // number of cells inspected
       place: geo.place,
     });
   } catch (e) {
