@@ -1,4 +1,3 @@
-// pages/api/coverage.js
 import { request } from "undici";
 import fs from "node:fs";
 import path from "node:path";
@@ -53,6 +52,11 @@ function operatorFromMccMnc(mcc, mnc) {
   return MCCMNC_MAP[key];
 }
 
+// If operator is unknown, label with MCC/MNC instead of dropping it.
+function labelOperator(mcc, mnc) {
+  return operatorFromMccMnc(mcc, mnc) || `MCC${mcc}-MNC${String(mnc).padStart(3, "0")}`;
+}
+
 // ---- OpenCelliD single-box (adaptive) ----
 async function fetchOpenCellIdBox({ lat, lon, radio, key, dStart = 0.008 }) {
   let d = dStart;               // ~1.5–2km half-side (under 4 km² per request)
@@ -86,11 +90,11 @@ async function fetchOpenCellIdBox({ lat, lon, radio, key, dStart = 0.008 }) {
   return [];
 }
 
-// ---- Multi-ring fan-out (center + 3 rings) for one radio ----
+// ---- Multi-ring fan-out (center + up to 5 rings) for one radio ----
 async function fanoutForRadio({ lat, lon, radio, key }) {
   const boxD = 0.008;   // per-request half-side
-  const rings = 3;      // 0..3 rings (up to 36 boxes)
-  const hardCap = 24;   // guardrail per radio
+  const rings = 5;      // 0..5 rings (wider rural reach)
+  const hardCap = 36;   // guardrail per radio
 
   function ringOffsets(r) {
     if (r === 0) return [[0, 0]];
@@ -117,9 +121,9 @@ async function fanoutForRadio({ lat, lon, radio, key }) {
         const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}-${radio}`;
         if (!seen.has(id)) { seen.add(id); all.push(c); }
       }
-      if (all.length >= 40) break;
+      if (all.length >= 60) break;
     }
-    if (calls >= hardCap || all.length >= 40) break;
+    if (calls >= hardCap || all.length >= 60) break;
   }
   return all;
 }
@@ -135,7 +139,7 @@ async function queryAnyRadios({ lat, lon }) {
   const key = process.env.OPENCELLID_API_KEY;
   if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
 
-  // Common radios in OpenCelliD (order by modern-first)
+  // Common radios (modern-first); OCID normalizes to these
   const radios = ["NR", "LTE", "WCDMA", "UMTS", "GSM", "CDMA"];
   const all = [];
   for (const r of radios) {
@@ -160,8 +164,7 @@ export default async function handler(req, res) {
     const lteCells = await queryLTE(geo);
     const lteOpsSet = new Set();
     for (const c of lteCells) {
-      const op = operatorFromMccMnc(c.mcc, c.mnc);
-      if (op) lteOpsSet.add(op);
+      lteOpsSet.add(labelOperator(c.mcc, c.mnc));
     }
     const lteOperators = Array.from(lteOpsSet);
 
@@ -170,9 +173,8 @@ export default async function handler(req, res) {
     const networks = lteOperators.filter(op => allowed.has(op));
     const connects = networks.length > 0;
 
-    // Always build a structured detection list for UI: [{radio, operator}]
+    // Structured detections for UI: [{radio, operator}]
     const detected = [];
-    // Start with LTE detections
     for (const op of lteOperators) detected.push({ radio: "LTE", operator: op });
 
     let reason;
@@ -192,9 +194,9 @@ export default async function handler(req, res) {
         const seenPairs = new Set();
 
         for (const c of anyCells) {
-          const op = operatorFromMccMnc(c.mcc, c.mnc);
+          const op = labelOperator(c.mcc, c.mnc); // never drop unknowns
           const r = (c.radio || "").toUpperCase();
-          if (!op || !r) continue;
+          if (!r) continue;
 
           if (!byRadio.has(r)) byRadio.set(r, new Set());
           byRadio.get(r).add(op);
@@ -207,14 +209,12 @@ export default async function handler(req, res) {
         }
 
         if (byRadio.size > 0) {
-          // Create concise human-readable reason
           const parts = [];
           for (const [r, ops] of byRadio.entries()) {
             parts.push(`${r}: ${Array.from(ops).join(", ")}`);
           }
           parts.sort();
           reason = `No LTE towers found near ${zip} (${geo.place}). Detected other towers: ${parts.join("; ")}.`;
-          // presentOperators becomes union of all detected operators (any radio)
           presentOperators = Array.from(
             new Set(detected.map(d => d.operator))
           );
