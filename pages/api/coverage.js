@@ -53,16 +53,11 @@ function operatorFromMccMnc(mcc, mnc) {
 }
 
 // ---- OpenCelliD query (adaptive + fan-out) ----
-// Keeps each request under ~4 km², retries smaller if needed, and samples
-// 9 small boxes (center + neighbors) to avoid missing rural towers.
 async function queryOpenCellIdLTE({ lat, lon }) {
   const key = process.env.OPENCELLID_API_KEY;
   if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
 
-  // each small box half-size in degrees (~1.5–2km at US latitudes)
-  const boxD = 0.008;
-
-  // 9 offsets: center, N,S,E,W, and 4 diagonals
+  const boxD = 0.008; // ~1.5–2 km half-side; under free limit
   const offsets = [
     [0, 0],
     [ boxD, 0], [-boxD, 0],
@@ -70,45 +65,55 @@ async function queryOpenCellIdLTE({ lat, lon }) {
     [ boxD,  boxD], [ boxD, -boxD], [-boxD,  boxD], [-boxD, -boxD],
   ];
 
-  // helper that tries a single box with adaptive shrinking if OCID says “BBOX too big”
   async function fetchBox(centerLat, centerLon, dStart = boxD) {
-    let d = dStart;                 // start at boxD
-    const minD = 0.004;             // ~0.8–1km half-side
-    for (let i = 0; i < 6; i++) {   // up to 6 shrink attempts
+    let d = dStart;
+    const minD = 0.004;
+    for (let i = 0; i < 6; i++) {
       const bbox = `${(centerLat - d).toFixed(6)},${(centerLon - d).toFixed(6)},${(centerLat + d).toFixed(6)},${(centerLon + d).toFixed(6)}`;
-      const url = `https://www.opencellid.org/cell/getInArea?key=${encodeURIComponent(key)}&BBOX=${bbox}&radio=LTE&format=json`;
+      const url = `https://www.opencellid.org/cell/getInArea?key=${encodeURIComponent(
+        key
+      )}&BBOX=${bbox}&radio=LTE&format=json`;
       const { body } = await request(url, { method: "GET" });
       const text = await body.text();
-
       let data;
-      try { data = JSON.parse(text); } catch {
-        // got HTML or non-JSON → treat as empty for now
+      try {
+        data = JSON.parse(text);
+      } catch {
         return [];
       }
-
-      if (data?.error && String(data.error).toLowerCase().includes("bbox too big")) {
+      if (
+        data?.error &&
+        String(data.error).toLowerCase().includes("bbox too big")
+      ) {
         d = Math.max(minD, d / 2);
         continue;
       }
-
-      const cells = Array.isArray(data?.cells) ? data.cells :
-                    Array.isArray(data) ? data : [];
-      return cells.filter(c => c && c.mcc !== undefined && c.mnc !== undefined);
+      const cells = Array.isArray(data?.cells)
+        ? data.cells
+        : Array.isArray(data)
+        ? data
+        : [];
+      return cells.filter(
+        (c) => c && c.mcc !== undefined && c.mnc !== undefined
+      );
     }
     return [];
   }
 
-  const seen = new Set(); // dedupe by mcc-mnc-cid
+  const seen = new Set();
   const all = [];
 
   for (const [dy, dx] of offsets) {
     const cells = await fetchBox(lat + dy, lon + dx);
     for (const c of cells) {
       const cid = c.cid ?? c.cellid ?? "";
-      const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}`;
-      if (!seen.has(id)) { seen.add(id); all.push(c); }
+      const id = `${c.mcc}-${String(c.mnc).padStart(3, "0")}-${cid}`;
+      if (!seen.has(id)) {
+        seen.add(id);
+        all.push(c);
+      }
     }
-    if (all.length >= 30) break; // stop early if we already have a healthy sample
+    if (all.length >= 30) break;
   }
 
   return all;
@@ -119,7 +124,9 @@ export default async function handler(req, res) {
   try {
     const zip = String(req.query.zip || "").trim();
     if (!/^\d{5}(-\d{4})?$/.test(zip)) {
-      res.status(400).json({ error: "Please provide a valid US ZIP (5 digits)." });
+      res
+        .status(400)
+        .json({ error: "Please provide a valid US ZIP (5 digits)." });
       return;
     }
 
@@ -134,15 +141,17 @@ export default async function handler(req, res) {
 
     const presentOperators = Array.from(present);
     const allowed = buildAllowedSet();
-    const matches = presentOperators.filter(op => allowed.has(op));
+    const matches = presentOperators.filter((op) => allowed.has(op));
     const connects = matches.length > 0;
 
     let reason;
     if (!connects) {
       if (presentOperators.length) {
-        reason = `LTE towers found near ${zip} (${geo.place}) for: ${presentOperators.join(", ")}, but none match FloLive EU2/US2.`;
+        reason = `No FloLive EU2/US2 networks in ${zip} (${geo.place}), but LTE towers were detected for: ${presentOperators.join(
+          ", "
+        )}.`;
       } else {
-        reason = `No LTE cells returned by OpenCelliD near ${zip} (${geo.place}). Crowd data may be sparse here.`;
+        reason = `No LTE towers found near ${zip} (${geo.place}). Crowd data may be sparse in this area.`;
       }
     }
 
