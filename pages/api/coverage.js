@@ -52,22 +52,33 @@ function operatorFromMccMnc(mcc, mnc) {
   return MCCMNC_MAP[key];
 }
 
-// ---- OpenCelliD query (adaptive + fan-out) ----
+// ---- OpenCelliD query (adaptive + multi-ring fan-out) ----
+// Each request stays under the ~4 km² limit; we sample up to 3 rings
+// around the ZIP centroid to improve rural hit rate.
 async function queryOpenCellIdLTE({ lat, lon }) {
   const key = process.env.OPENCELLID_API_KEY;
   if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
 
-  const boxD = 0.008; // ~1.5–2 km half-side; under free limit
-  const offsets = [
-    [0, 0],
-    [ boxD, 0], [-boxD, 0],
-    [0,  boxD], [0, -boxD],
-    [ boxD,  boxD], [ boxD, -boxD], [-boxD,  boxD], [-boxD, -boxD],
-  ];
+  const boxD = 0.008;        // ~1.5–2 km half-side (safe per-request)
+  const rings = 3;           // 0 (center) + 1 + 2 + 3 rings => up to 36 boxes max
+  const hardCap = 24;        // don’t exceed this many requests
+
+  function ringOffsets(r) {
+    if (r === 0) return [[0, 0]];
+    const vals = [-r, 0, r];
+    const out = [];
+    for (const dy of vals) {
+      for (const dx of vals) {
+        if (dy === 0 && dx === 0) continue;
+        out.push([dy * boxD, dx * boxD]);
+      }
+    }
+    return out;
+  }
 
   async function fetchBox(centerLat, centerLon, dStart = boxD) {
     let d = dStart;
-    const minD = 0.004;
+    const minD = 0.004;  // ~0.8–1 km half-side
     for (let i = 0; i < 6; i++) {
       const bbox = `${(centerLat - d).toFixed(6)},${(centerLon - d).toFixed(6)},${(centerLat + d).toFixed(6)},${(centerLon + d).toFixed(6)}`;
       const url = `https://www.opencellid.org/cell/getInArea?key=${encodeURIComponent(
@@ -75,45 +86,41 @@ async function queryOpenCellIdLTE({ lat, lon }) {
       )}&BBOX=${bbox}&radio=LTE&format=json`;
       const { body } = await request(url, { method: "GET" });
       const text = await body.text();
+
       let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        return [];
-      }
-      if (
-        data?.error &&
-        String(data.error).toLowerCase().includes("bbox too big")
-      ) {
+      try { data = JSON.parse(text); } catch { return []; }
+
+      if (data?.error && String(data.error).toLowerCase().includes("bbox too big")) {
         d = Math.max(minD, d / 2);
         continue;
       }
-      const cells = Array.isArray(data?.cells)
-        ? data.cells
-        : Array.isArray(data)
-        ? data
-        : [];
-      return cells.filter(
-        (c) => c && c.mcc !== undefined && c.mnc !== undefined
-      );
+
+      const cells = Array.isArray(data?.cells) ? data.cells :
+                    Array.isArray(data) ? data : [];
+      return cells.filter(c => c && c.mcc !== undefined && c.mnc !== undefined);
     }
     return [];
   }
 
   const seen = new Set();
   const all = [];
+  let calls = 0;
 
-  for (const [dy, dx] of offsets) {
-    const cells = await fetchBox(lat + dy, lon + dx);
-    for (const c of cells) {
-      const cid = c.cid ?? c.cellid ?? "";
-      const id = `${c.mcc}-${String(c.mnc).padStart(3, "0")}-${cid}`;
-      if (!seen.has(id)) {
-        seen.add(id);
-        all.push(c);
+  for (let r = 0; r <= rings; r++) {
+    const offsets = ringOffsets(r);
+    for (const [dy, dx] of offsets) {
+      if (calls >= hardCap) break;
+      calls++;
+      const cells = await fetchBox(lat + dy, lon + dx);
+      for (const c of cells) {
+        const cid = c.cid ?? c.cellid ?? "";
+        const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}`;
+        if (!seen.has(id)) { seen.add(id); all.push(c); }
       }
+      // Early stop if we already have plenty of samples
+      if (all.length >= 40) break;
     }
-    if (all.length >= 30) break;
+    if (calls >= hardCap || all.length >= 40) break;
   }
 
   return all;
@@ -124,9 +131,7 @@ export default async function handler(req, res) {
   try {
     const zip = String(req.query.zip || "").trim();
     if (!/^\d{5}(-\d{4})?$/.test(zip)) {
-      res
-        .status(400)
-        .json({ error: "Please provide a valid US ZIP (5 digits)." });
+      res.status(400).json({ error: "Please provide a valid US ZIP (5 digits)." });
       return;
     }
 
@@ -141,15 +146,13 @@ export default async function handler(req, res) {
 
     const presentOperators = Array.from(present);
     const allowed = buildAllowedSet();
-    const matches = presentOperators.filter((op) => allowed.has(op));
+    const matches = presentOperators.filter(op => allowed.has(op));
     const connects = matches.length > 0;
 
     let reason;
     if (!connects) {
       if (presentOperators.length) {
-        reason = `No FloLive EU2/US2 networks in ${zip} (${geo.place}), but LTE towers were detected for: ${presentOperators.join(
-          ", "
-        )}.`;
+        reason = `No FloLive EU2/US2 networks in ${zip} (${geo.place}), but LTE towers were detected for: ${presentOperators.join(", ")}.`;
       } else {
         reason = `No LTE towers found near ${zip} (${geo.place}). Crowd data may be sparse in this area.`;
       }
@@ -159,7 +162,7 @@ export default async function handler(req, res) {
       connects,
       networks: matches,
       reason,
-      presentOperators,
+      presentOperators,         // always returned for UI
       cellsCount: cells.length,
       place: geo.place,
     });
