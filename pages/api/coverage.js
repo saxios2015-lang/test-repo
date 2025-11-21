@@ -1,121 +1,123 @@
 
-import * as cheerio from 'cheerio';
 import { request } from 'undici';
 import fs from 'node:fs';
 import path from 'node:path';
 
-// Load FloLive mapping (US & territories subset) at runtime
-const dataPath = path.join(process.cwd(), 'data', 'floLive_US_EU2_US2.json');
-const FLOLIVE = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+// Load FloLive EU2/US2 operator list (already in your repo from earlier steps)
+const FLOLIVE = JSON.parse(
+  fs.readFileSync(path.join(process.cwd(), 'data', 'floLive_US_EU2_US2.json'), 'utf-8')
+);
 
-// Normalize noisy owner strings into canonical carrier names
-const NORMALIZE_MAP = {
-  "at&t": "AT&T",
-  "att": "AT&T",
-  "at&t mobility": "AT&T",
-  "new cingular": "AT&T",
-  "t-mobile": "T-Mobile",
-  "tmobile": "T-Mobile",
-  "t-mobile usa": "T-Mobile",
-  "verizon": "Verizon",
-  "verizon wireless": "Verizon",
-  "cellco": "Verizon",
-  "u.s. cellular": "US Cellular",
-  "us cellular": "US Cellular",
-  "united states cellular": "US Cellular",
-  "united states cellular corporation": "US Cellular",
-  "liberty puerto rico": "Liberty Puerto Rico",
-  "union wireless": "Union Wireless",
-  "union telephone": "Union Wireless",
-  "appalachian": "Appalachian",
-  "carolina west": "Carolina West",
-  "james valley": "James Valley",
-  "nex-tech": "Nex-Tech",
-  "nex tech": "Nex-Tech",
-  "united wireless": "United Wireless",
-  "viaero": "Viaero",
-  "c-spire": "C-Spire",
-  "c spire": "C-Spire",
-  "the alaska wireless": "The Alaska Wireless"
-};
+// Load MCCMNC -> Operator mapping derived from your FloLive workbook (US & territories)
+const MCCMNC_MAP = JSON.parse(
+  fs.readFileSync(path.join(process.cwd(), 'data', 'us_mccmnc_to_operator_from_floLive_Aug2025.json'), 'utf-8')
+);
 
-function normalize(name) {
-  const t = (name || '').toLowerCase();
-  for (const key of Object.keys(NORMALIZE_MAP)) {
-    if (t.includes(key)) return NORMALIZE_MAP[key];
-  }
-  return (name || '').trim();
-}
-
+// Build allowed EU2/US2 operator set from your FloLive list
 function buildAllowedSet() {
   const allowed = new Set();
   for (const row of FLOLIVE) {
     if (row.IMSI_Provider === 'EU 2' || row.IMSI_Provider === 'US 2') {
-      allowed.add(normalize(row.Operator));
+      const op = (row.Operator || '').trim();
+      if (op) allowed.add(op);
     }
   }
   return allowed;
 }
 
-async function fetchTowerOwnersForZip(zip) {
-  const url = `https://www.antennasearch.com/HTML/search/search.php?address=${encodeURIComponent(zip)}`;
+// 1) Geocode a ZIP using Zippopotam.us
+async function geocodeZip(zip) {
+  const url = `https://api.zippopotam.us/us/${encodeURIComponent(zip)}`;
   const { body, statusCode } = await request(url, { method: 'GET' });
-  if (statusCode >= 400) throw new Error(`AntennaSearch error: ${statusCode}`);
-  const html = await body.text();
-  const $ = cheerio.load(html);
+  if (statusCode !== 200) throw new Error(`ZIP lookup failed (${statusCode})`);
+  const json = await body.json();
+  const p = json?.places?.[0];
+  if (!p) throw new Error('ZIP not found');
+  return {
+    lat: parseFloat(p.latitude),
+    lon: parseFloat(p.longitude),
+    place: `${p['place name']}, ${p['state abbreviation']}`
+  };
+}
 
-  const candidates = new Set();
-  $("table td, table th, .resultTable td, .resultTable th").each((_, el) => {
-    const txt = $(el).text().trim();
-    if (!txt) return;
-    const lower = txt.toLowerCase();
-    if (/[a-z]/.test(lower) && txt.length <= 60) candidates.add(txt);
+// 2) Query OpenCelliD in a small bounding box around ZIP centroid
+async function queryOpenCellIdLTE({ lat, lon }) {
+  const key = process.env.OPENCELLID_API_KEY;
+  if (!key) throw new Error('Server missing OPENCELLID_API_KEY');
+
+  // ~5km bbox (~0.045 deg). You can tweak this.
+  const d = 0.045;
+  const bbox = `${(lat - d).toFixed(6)},${(lon - d).toFixed(6)},${(lat + d).toFixed(6)},${(lon + d).toFixed(6)}`;
+
+  const url = `https://www.opencellid.org/cell/getInArea?key=${encodeURIComponent(
+    key
+  )}&BBOX=${bbox}&radio=LTE&format=json`;
+
+  const { body, statusCode } = await request(url, {
+    method: 'GET',
+    headers: {
+      'user-agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+      'accept': 'application/json,text/html;q=0.9'
+    }
   });
 
-  const HINTS = [
-    "verizon","t-mobile","tmobile","at&t","cingular","cellco","us cellular",
-    "liberty puerto rico","union","appalachian","carolina west","james valley",
-    "nex-tech","viaero","c-spire","united wireless","alaska wireless"
-  ];
-  const owners = Array.from(candidates).filter((c) => {
-    const lc = c.toLowerCase();
-    return HINTS.some((h) => lc.includes(h));
+  if (statusCode >= 400) throw new Error(`OpenCelliD error: ${statusCode}`);
+  const data = await body.json().catch(async () => {
+    const txt = await body.text();
+    throw new Error(`Unexpected OpenCelliD response: ${txt.slice(0, 200)}…`);
   });
 
-  return owners;
+  const cells = Array.isArray(data?.cells) ? data.cells : Array.isArray(data) ? data : [];
+  return cells.filter(c => c && typeof c.mcc !== 'undefined' && typeof c.mnc !== 'undefined');
+}
+
+// 3) Map MCC+MNC to operator using your FloLive-derived mapping
+function operatorFromMccMnc(mcc, mnc) {
+  const key = String(mcc) + String(mnc).padStart(3, '0'); // zero-pad MNC to 3
+  return MCCMNC_MAP[key];
 }
 
 export default async function handler(req, res) {
-  const zip = String(req.query.zip || '').trim();
-  if (!/^\d{5}(-\d{4})?$/.test(zip)) {
-    res.status(400).json({ error: 'Please provide a valid US ZIP (5 digits).' });
-    return;
-  }
+  try {
+    const zip = String(req.query.zip || '').trim();
+    if (!/^\d{5}(-\d{4})?$/.test(zip)) {
+      res.status(400).json({ error: 'Please provide a valid US ZIP (5 digits).' });
+      return;
+    }
 
-  const allowed = buildAllowedSet();
-  const rawOwners = await fetchTowerOwnersForZip(zip).catch(e => {
+    const geo = await geocodeZip(zip);
+    const cells = await queryOpenCellIdLTE(geo);
+
+    const present = new Set();
+    for (const c of cells) {
+      const op = operatorFromMccMnc(c.mcc, c.mnc);
+      if (op) present.add(op);
+    }
+    const presentOperators = Array.from(present);
+
+    const allowed = buildAllowedSet();
+    const matches = presentOperators.filter(op => allowed.has(op));
+    const connects = matches.length > 0;
+
+    let reason;
+    if (!connects) {
+      if (presentOperators.length) {
+        reason = `ZIP ${zip} (${geo.place}) shows LTE cells for: ${presentOperators.join(', ')}, which are not in FloLive EU2/US2.`;
+      } else {
+        reason = `No LTE cells returned by OpenCelliD for ZIP ${zip} (${geo.place}).`;
+      }
+    }
+
+    res.status(200).json({
+      connects,
+      networks: matches,
+      reason,
+      presentOperators,
+      cellsCount: cells.length,
+      place: geo.place
+    });
+  } catch (e) {
     res.status(502).json({ error: e?.message || 'Lookup failed' });
-    return null;
-  });
-  if (rawOwners == null) return;
-
-  const normalized = rawOwners.map(normalize);
-  const matches = normalized.filter(n => allowed.has(n));
-  const uniqueMatches = Array.from(new Set(matches));
-  const connects = uniqueMatches.length > 0;
-
-  let reason;
-  if (!connects) {
-    const foundUnique = Array.from(new Set(normalized));
-    reason = foundUnique.length
-      ? `ZIP ${zip} shows towers for: ${foundUnique.join(', ')}, which are not in FloLive EU2/US2.`
-      : `No recognizable carriers found for ZIP ${zip} from tower data.`;
   }
-
-  res.status(200).json({
-    connects,
-    networks: uniqueMatches,
-    reason,
-    rawProviders: Array.from(new Set(rawOwners)),
-  });
 }
