@@ -1,0 +1,134 @@
+[
+  {
+    "Operator": "AT&T",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "AT&T Mobility",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "AT&T USA",
+    "IMSI_Provider": "EU 2"
+  },
+  {
+    "Operator": "Appalachian",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "C-Spire",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Cable & Wireless (BVI)",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "Caribbean Cellular Telephone",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "Carolina West",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Claro Puerto Rico",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Claro Puerto Rico",
+    "IMSI_Provider": "EU 2"
+  },
+  {
+    "Operator": "Copper Valley",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Cross Tel/Bravado Wireless",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Digicel British Virgin Islands",
+    "IMSI_Provider": "EU 2"
+  },
+  {
+    "Operator": "Digicel British Virgin Islands",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "Flow British Virgin Islands",
+    "IMSI_Provider": "EU 2"
+  },
+  {
+    "Operator": "Inland",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "James Valley",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Liberty Puerto Rico",
+    "IMSI_Provider": "EU 2"
+  },
+  {
+    "Operator": "Nex Tech",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "PTCI/PanHandle",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Pine Belt Cellular",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Strata-Snake River (Eagle Telephone)",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "T-Mobile USA",
+    "IMSI_Provider": "EU 2"
+  },
+  {
+    "Operator": "T-Mobile USA",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "The Alaska Wireless",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "Union Telephone Company",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "Union Wireless USA",
+    "IMSI_Provider": "EU 2"
+  },
+  {
+    "Operator": "United States Cellular Corporation",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "United Wireless",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "V-Tel",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Verizon",
+    "IMSI_Provider": "US 2"
+  },
+  {
+    "Operator": "Verizon Wireless",
+    "IMSI_Provider": "EU 4"
+  },
+  {
+    "Operator": "Viaero",
+    "IMSI_Provider": "US 2"
+  }
+]
