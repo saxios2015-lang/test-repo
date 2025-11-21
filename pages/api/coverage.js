@@ -1,4 +1,4 @@
-import { request } from "undici";
+import { request } from "undici";import { request } from "undici";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -52,7 +52,7 @@ function operatorFromMccMnc(mcc, mnc) {
   return MCCMNC_MAP[key];
 }
 
-// If we don’t have a friendly operator name, still surface the tower.
+// If we don’t have a friendly operator name, surface the tower anyway.
 function labelOperator(mcc, mnc) {
   return operatorFromMccMnc(mcc, mnc) || `MCC${mcc}-MNC${String(mnc).padStart(3, "0")}`;
 }
@@ -86,30 +86,48 @@ async function fetchOpenCellIdBox({ lat, lon, radio, key, dStart = 0.008 }) {
   return [];
 }
 
-// ---- Multi-ring fan-out (wider rural reach) for one radio ----
-// Up to 8 rings (~0.064° ~= 7–8 km radius) around the ZIP centroid.
+// ---- Full-grid ring fan-out (no gaps) for one radio ----
+// Covers every grid cell on the ring border up to maxR rings.
 async function fanoutForRadio({ lat, lon, radio, key }) {
-  const boxD = 0.008;
-  const rings = 8;      // 0..8 rings (81 boxes max); rural-friendly
-  const hardCap = 72;   // safety guard per radio
+  const boxD = 0.008;   // per-request half-side (safe)
+  const maxR = 8;       // 0..8 rings → ~7–8 km radius at mid/high lat
+  const hardCap = 120;  // overall guardrail per radio
 
-  function ringOffsets(r) {
-    if (r === 0) return [[0, 0]];
-    const vals = [-r, 0, r];
-    const out = [];
-    for (const dy of vals) for (const dx of vals) {
-      if (dy === 0 && dx === 0) continue;
-      out.push([dy * boxD, dx * boxD]);
-    }
-    return out;
-  }
-
-  const seen = new Set(); // dedupe by mcc-mnc-cid-radio
+  const seen = new Set();
   const all = [];
   let calls = 0;
 
-  for (let r = 0; r <= rings; r++) {
-    for (const [dy, dx] of ringOffsets(r)) {
+  // r = 0 is center
+  const offsets0 = [[0, 0]];
+  for (const [dy, dx] of offsets0) {
+    if (calls >= hardCap) break;
+    calls++;
+    const cells = await fetchOpenCellIdBox({ lat: lat + dy, lon: lon + dx, radio, key, dStart: boxD });
+    for (const c of cells) {
+      const cid = c.cid ?? c.cellid ?? "";
+      const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}-${radio}`;
+      if (!seen.has(id)) { seen.add(id); all.push(c); }
+    }
+    if (all.length >= 80) break;
+  }
+  if (calls >= hardCap || all.length >= 80) return all;
+
+  // r >= 1: iterate ONLY the border of the square ring (no duplicates, full coverage)
+  for (let r = 1; r <= maxR; r++) {
+    const dxMin = -r, dxMax = r, dyMin = -r, dyMax = r;
+    const offsets = [];
+    // top & bottom rows
+    for (let x = dxMin; x <= dxMax; x++) {
+      offsets.push([dyMin * boxD, x * boxD]);
+      offsets.push([dyMax * boxD, x * boxD]);
+    }
+    // left & right columns (excluding corners already added)
+    for (let y = dyMin + 1; y <= dyMax - 1; y++) {
+      offsets.push([y * boxD, dxMin * boxD]);
+      offsets.push([y * boxD, dxMax * boxD]);
+    }
+
+    for (const [dy, dx] of offsets) {
       if (calls >= hardCap) break;
       calls++;
       const cells = await fetchOpenCellIdBox({ lat: lat + dy, lon: lon + dx, radio, key, dStart: boxD });
@@ -118,9 +136,9 @@ async function fanoutForRadio({ lat, lon, radio, key }) {
         const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}-${radio}`;
         if (!seen.has(id)) { seen.add(id); all.push(c); }
       }
-      if (all.length >= 80) break;
+      if (all.length >= 100) break;
     }
-    if (calls >= hardCap || all.length >= 80) break;
+    if (calls >= hardCap || all.length >= 100) break;
   }
   return all;
 }
@@ -136,7 +154,7 @@ async function queryAnyRadios({ lat, lon }) {
   const key = process.env.OPENCELLID_API_KEY;
   if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
 
-  // Include both UMTS and WCDMA (some users label one or the other)
+  // Include both UMTS and WCDMA, plus LTE, NR/5G, GSM, CDMA
   const radios = ["NR", "LTE", "UMTS", "WCDMA", "GSM", "CDMA"];
   const all = [];
   for (const r of radios) {
@@ -149,13 +167,25 @@ async function queryAnyRadios({ lat, lon }) {
 // ---- API handler ----
 export default async function handler(req, res) {
   try {
-    const zip = String(req.query.zip || "").trim();
-    if (!/^\d{5}(-\d{4})?$/.test(zip)) {
-      res.status(400).json({ error: "Please provide a valid US ZIP (5 digits)." });
-      return;
+    // NEW: allow direct lat/lon override for debugging (e.g. Bethel tower coords)
+    const hasLatLon = req.query.lat && req.query.lon;
+    let geo;
+    if (hasLatLon) {
+      const lat = parseFloat(String(req.query.lat));
+      const lon = parseFloat(String(req.query.lon));
+      if (Number.isNaN(lat) || Number.isNaN(lon)) {
+        res.status(400).json({ error: "Invalid lat/lon." });
+        return;
+      }
+      geo = { lat, lon, place: "custom point" };
+    } else {
+      const zip = String(req.query.zip || "").trim();
+      if (!/^\d{5}(-\d{4})?$/.test(zip)) {
+        res.status(400).json({ error: "Please provide a valid US ZIP (5 digits) or lat/lon." });
+        return;
+      }
+      geo = await geocodeZip(zip);
     }
-
-    const geo = await geocodeZip(zip);
 
     // 1) LTE first (TG3 is LTE-only)
     const lteCells = await queryLTE(geo);
@@ -178,7 +208,7 @@ export default async function handler(req, res) {
 
     if (!connects) {
       if (lteOperators.length > 0) {
-        reason = `No FloLive EU2/US2 networks in ${zip} (${geo.place}), but LTE towers were detected for: ${lteOperators.join(", ")}.`;
+        reason = `No FloLive EU2/US2 networks near ${geo.place}, but LTE towers were detected for: ${lteOperators.join(", ")}.`;
       } else {
         // 2) No LTE at all → look for ANY radio and list providers with radio types
         const anyCells = await queryAnyRadios(geo);
@@ -205,10 +235,10 @@ export default async function handler(req, res) {
             parts.push(`${r}: ${Array.from(ops).join(", ")}`);
           }
           parts.sort();
-          reason = `No LTE towers found near ${zip} (${geo.place}). Detected other towers: ${parts.join("; ")}.`;
+          reason = `No LTE towers found near ${geo.place}. Detected other towers: ${parts.join("; ")}.`;
           presentOperators = Array.from(new Set(detected.map(d => d.operator)));
         } else {
-          reason = `No towers of any radio type found near ${zip} (${geo.place}). Crowd data may be sparse in this area.`;
+          reason = `No towers of any radio type found near ${geo.place}. Crowd data may be sparse in this area.`;
           presentOperators = [];
         }
       }
@@ -222,6 +252,10 @@ export default async function handler(req, res) {
       detected,                 // [{ radio, operator }] list for UI
       cellsCount,
       place: geo.place,
+      searched: {               // helpful debug metadata
+        rings: 8,
+        perBoxHalfDeg: 0.008
+      }
     });
   } catch (e) {
     res.status(502).json({ error: e?.message || "Lookup failed" });
