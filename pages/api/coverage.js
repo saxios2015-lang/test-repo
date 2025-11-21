@@ -52,15 +52,15 @@ function operatorFromMccMnc(mcc, mnc) {
   return MCCMNC_MAP[key];
 }
 
-// If operator is unknown, label with MCC/MNC instead of dropping it.
+// If we don’t have a friendly operator name, still surface the tower.
 function labelOperator(mcc, mnc) {
   return operatorFromMccMnc(mcc, mnc) || `MCC${mcc}-MNC${String(mnc).padStart(3, "0")}`;
 }
 
-// ---- OpenCelliD single-box (adaptive) ----
+// ---- One OCID box (adaptive shrink if they say bbox too big) ----
 async function fetchOpenCellIdBox({ lat, lon, radio, key, dStart = 0.008 }) {
-  let d = dStart;               // ~1.5–2km half-side (under 4 km² per request)
-  const minD = 0.004;           // ~0.8–1km half-side
+  let d = dStart;               // ~1.5–2 km half-side per request (<= 4 km²)
+  const minD = 0.004;           // ~0.8–1 km
   for (let i = 0; i < 6; i++) {
     const bbox = `${(lat - d).toFixed(6)},${(lon - d).toFixed(6)},${(lat + d).toFixed(6)},${(lon + d).toFixed(6)}`;
     const url = `https://www.opencellid.org/cell/getInArea?key=${encodeURIComponent(
@@ -70,11 +70,7 @@ async function fetchOpenCellIdBox({ lat, lon, radio, key, dStart = 0.008 }) {
     const text = await body.text();
 
     let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return []; // non-JSON (e.g., HTML throttle) → treat as empty
-    }
+    try { data = JSON.parse(text); } catch { return []; }
 
     if (data?.error && String(data.error).toLowerCase().includes("bbox too big")) {
       d = Math.max(minD, d / 2);
@@ -90,11 +86,12 @@ async function fetchOpenCellIdBox({ lat, lon, radio, key, dStart = 0.008 }) {
   return [];
 }
 
-// ---- Multi-ring fan-out (center + up to 5 rings) for one radio ----
+// ---- Multi-ring fan-out (wider rural reach) for one radio ----
+// Up to 8 rings (~0.064° ~= 7–8 km radius) around the ZIP centroid.
 async function fanoutForRadio({ lat, lon, radio, key }) {
-  const boxD = 0.008;   // per-request half-side
-  const rings = 5;      // 0..5 rings (wider rural reach)
-  const hardCap = 36;   // guardrail per radio
+  const boxD = 0.008;
+  const rings = 8;      // 0..8 rings (81 boxes max); rural-friendly
+  const hardCap = 72;   // safety guard per radio
 
   function ringOffsets(r) {
     if (r === 0) return [[0, 0]];
@@ -121,9 +118,9 @@ async function fanoutForRadio({ lat, lon, radio, key }) {
         const id = `${c.mcc}-${String(c.mnc).padStart(3,"0")}-${cid}-${radio}`;
         if (!seen.has(id)) { seen.add(id); all.push(c); }
       }
-      if (all.length >= 60) break;
+      if (all.length >= 80) break;
     }
-    if (calls >= hardCap || all.length >= 60) break;
+    if (calls >= hardCap || all.length >= 80) break;
   }
   return all;
 }
@@ -139,8 +136,8 @@ async function queryAnyRadios({ lat, lon }) {
   const key = process.env.OPENCELLID_API_KEY;
   if (!key) throw new Error("Server missing OPENCELLID_API_KEY");
 
-  // Common radios (modern-first); OCID normalizes to these
-  const radios = ["NR", "LTE", "WCDMA", "UMTS", "GSM", "CDMA"];
+  // Include both UMTS and WCDMA (some users label one or the other)
+  const radios = ["NR", "LTE", "UMTS", "WCDMA", "GSM", "CDMA"];
   const all = [];
   for (const r of radios) {
     const cells = await fanoutForRadio({ lat, lon, radio: r, key });
@@ -163,9 +160,7 @@ export default async function handler(req, res) {
     // 1) LTE first (TG3 is LTE-only)
     const lteCells = await queryLTE(geo);
     const lteOpsSet = new Set();
-    for (const c of lteCells) {
-      lteOpsSet.add(labelOperator(c.mcc, c.mnc));
-    }
+    for (const c of lteCells) lteOpsSet.add(labelOperator(c.mcc, c.mnc));
     const lteOperators = Array.from(lteOpsSet);
 
     // EU2/US2 decision (LTE-only)
@@ -173,7 +168,7 @@ export default async function handler(req, res) {
     const networks = lteOperators.filter(op => allowed.has(op));
     const connects = networks.length > 0;
 
-    // Structured detections for UI: [{radio, operator}]
+    // Always build a structured detection list for UI: [{radio, operator}]
     const detected = [];
     for (const op of lteOperators) detected.push({ radio: "LTE", operator: op });
 
@@ -189,8 +184,7 @@ export default async function handler(req, res) {
         const anyCells = await queryAnyRadios(geo);
         cellsCount = anyCells.length;
 
-        // Build radio → operators map and detected[]
-        const byRadio = new Map();
+        const byRadio = new Map();  // radio -> Set(operators)
         const seenPairs = new Set();
 
         for (const c of anyCells) {
@@ -201,11 +195,8 @@ export default async function handler(req, res) {
           if (!byRadio.has(r)) byRadio.set(r, new Set());
           byRadio.get(r).add(op);
 
-          const key = `${r}::${op}`;
-          if (!seenPairs.has(key)) {
-            seenPairs.add(key);
-            detected.push({ radio: r, operator: op });
-          }
+          const k = `${r}::${op}`;
+          if (!seenPairs.has(k)) { seenPairs.add(k); detected.push({ radio: r, operator: op }); }
         }
 
         if (byRadio.size > 0) {
@@ -215,9 +206,7 @@ export default async function handler(req, res) {
           }
           parts.sort();
           reason = `No LTE towers found near ${zip} (${geo.place}). Detected other towers: ${parts.join("; ")}.`;
-          presentOperators = Array.from(
-            new Set(detected.map(d => d.operator))
-          );
+          presentOperators = Array.from(new Set(detected.map(d => d.operator)));
         } else {
           reason = `No towers of any radio type found near ${zip} (${geo.place}). Crowd data may be sparse in this area.`;
           presentOperators = [];
@@ -230,8 +219,8 @@ export default async function handler(req, res) {
       networks,                 // EU2/US2 matches (LTE-only)
       reason,                   // explanation
       presentOperators,         // LTE ops if LTE exists; else union of all detected ops
-      detected,                 // [{ radio, operator }] for UI display
-      cellsCount,               // number of cells inspected
+      detected,                 // [{ radio, operator }] list for UI
+      cellsCount,
       place: geo.place,
     });
   } catch (e) {
